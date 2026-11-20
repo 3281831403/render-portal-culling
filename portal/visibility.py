@@ -50,12 +50,180 @@
 
 import math
 from collections import deque
+from collections.abc import Sequence
 
 EPS = 1e-6
+
+# 穿越传送门时为子视锥选择的 near / far。主相机自身的距离范围已由
+# camera["frustum"] 表达，子视锥只需要覆盖“透过该门”的开放锥体。
+_TRAVERSE_NEAR = 1e-4
+_TRAVERSE_FAR = 1e9
 
 
 class PortalError(Exception):
     """传送门剔除相关的输入 / 场景 / 几何非法。"""
+
+
+# ---------------------------------------------------------------------------
+# 内部小工具
+# ---------------------------------------------------------------------------
+
+
+def _is_real(value):
+    """真正的数值（``bool`` 是 ``int`` 子类，但不应当作坐标或深度）。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _number(value):
+    """把数值转成 float；非法时返回 ``None``。"""
+    if not _is_real(value):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _point(value, what="点"):
+    """校验三元坐标，返回 ``(x, y, z)`` 浮点元组。"""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise PortalError("%s 必须是三个数值" % what)
+    if len(value) != 3:
+        raise PortalError("%s 必须是三个数值" % what)
+    coords = tuple(_number(component) for component in value)
+    if any(component is None for component in coords):
+        raise PortalError("%s 必须是有限数值" % what)
+    return coords
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _length(a):
+    return math.sqrt(_dot(a, a))
+
+
+def _normalize_plane(plane):
+    """归一化平面；法线长度过小或分量非法时返回 ``None``。"""
+    if isinstance(plane, (str, bytes)) or not isinstance(plane, Sequence):
+        return None
+    if len(plane) != 4:
+        return None
+    values = [_number(component) for component in plane]
+    if any(component is None for component in values):
+        return None
+    a, b, c, d = values
+    length = math.sqrt(a * a + b * b + c * c)
+    if length <= EPS:
+        return None
+    return [a / length, b / length, c / length, d / length]
+
+
+def _newell_area(polygon):
+    """Newell 法计算多边形面积（三维，取法线与面积大小）。"""
+    nx = ny = nz = 0.0
+    count = len(polygon)
+    for index in range(count):
+        x0, y0, z0 = polygon[index]
+        x1, y1, z1 = polygon[(index + 1) % count]
+        nx += (y0 - y1) * (z0 + z1)
+        ny += (z0 - z1) * (x0 + x1)
+        nz += (x0 - x1) * (y0 + y1)
+    return 0.5 * math.sqrt(nx * nx + ny * ny + nz * nz)
+
+
+def _aabb_corners(aabb):
+    min_x, min_y, min_z, max_x, max_y, max_z = aabb
+    return [
+        (x, y, z)
+        for x in (min_x, max_x)
+        for y in (min_y, max_y)
+        for z in (min_z, max_z)
+    ]
+
+
+def _quad_normal(quad):
+    """按 ``n = (q1 - q0) x (q2 - q0)`` 计算未归一化法线。"""
+    q0, q1, q2 = quad[0], quad[1], quad[2]
+    return _cross(_sub(q1, q0), _sub(q2, q0))
+
+
+def _validate_quad(quad):
+    """校验传送门四边形，返回四个点；退化时返回 ``None``。"""
+    if isinstance(quad, (str, bytes)) or not isinstance(quad, Sequence):
+        return None
+    if len(quad) < 3:
+        return None
+    points = []
+    vertices = quad[:4] if len(quad) >= 4 else quad
+    for vertex in vertices:
+        try:
+            points.append(_point(vertex, "传送门顶点"))
+        except PortalError:
+            return None
+    if len(points) < 3:
+        return None
+    area_vector = _quad_normal(points)
+    if _length(area_vector) <= EPS:
+        return None
+    return points
+
+
+def _validate_rooms(scene):
+    """取出并校验 ``scene["rooms"]``，返回房间字典。"""
+    if not isinstance(scene, dict):
+        raise PortalError("scene 必须是字典")
+    rooms = scene.get("rooms")
+    if not isinstance(rooms, dict):
+        raise PortalError("scene 缺少 rooms")
+    return rooms
+
+
+def _validate_portals(scene):
+    portals = scene.get("portals", [])
+    if portals is None:
+        return []
+    if isinstance(portals, (str, bytes)) or not isinstance(portals, Sequence):
+        raise PortalError("scene['portals'] 必须是列表")
+    return list(portals)
+
+
+def _validate_camera(camera):
+    if not isinstance(camera, dict):
+        raise PortalError("camera 必须是字典")
+    for key in ("room", "position", "forward", "frustum"):
+        if key not in camera:
+            raise PortalError("camera 缺少 %s" % key)
+    _point(camera["position"], "camera.position")
+    _point(camera["forward"], "camera.forward")
+    frustum = camera["frustum"]
+    if isinstance(frustum, (str, bytes)) or not isinstance(frustum, Sequence):
+        raise PortalError("camera.frustum 必须是列表")
+    return camera
+
+
+def _validate_max_depth(max_depth):
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+        raise PortalError("max_depth 必须是整数")
+    if max_depth < 1:
+        raise PortalError("max_depth 必须 >= 1")
+    return max_depth
+
+
+# ---------------------------------------------------------------------------
+# 公开 API
+# ---------------------------------------------------------------------------
 
 
 def portal_frustum(camera, portal_quad, near, far):
@@ -78,7 +246,77 @@ def portal_frustum(camera, portal_quad, near, far):
         变化，并只覆盖"透过该门"可见的锥体。
         四边形退化（顶点不足 3 个、面积 <= 1e-6）或 near/far 非法时返回 ``[]``。
     """
-    raise NotImplementedError
+    if not isinstance(camera, dict):
+        return []
+    eye_value = camera.get("position")
+    forward_value = camera.get("forward")
+    try:
+        eye = _point(eye_value, "camera.position")
+        forward = _point(forward_value, "camera.forward")
+    except PortalError:
+        return []
+
+    near_value = _number(near)
+    far_value = _number(far)
+    if near_value is None or far_value is None:
+        return []
+    if not (0.0 < near_value < far_value):
+        return []
+
+    quad = _validate_quad(portal_quad)
+    if quad is None:
+        return []
+
+    planes = []
+
+    def add_plane(normal, point_on_plane):
+        length = _length(normal)
+        if length <= EPS:
+            return
+        a = normal[0] / length
+        b = normal[1] / length
+        c = normal[2] / length
+        d = -_dot((a, b, c), point_on_plane)
+        planes.append([a, b, c, d])
+
+    # 四个侧面：眼睛与 quad 每条边组成平面，内部为朝向门中心的一侧。
+    center = (
+        sum(vertex[0] for vertex in quad) / len(quad),
+        sum(vertex[1] for vertex in quad) / len(quad),
+        sum(vertex[2] for vertex in quad) / len(quad),
+    )
+    center_direction = _sub(center, eye)
+    for index in range(len(quad)):
+        vertex = quad[index]
+        following = quad[(index + 1) % len(quad)]
+        edge = _sub(following, vertex)
+        to_start = _sub(vertex, eye)
+        # 同时垂直于 edge 与 (vertex - eye)，因此该平面包含眼睛与这条边。
+        normal = _cross(edge, to_start)
+        if _dot(normal, center_direction) < 0.0:
+            normal = (-normal[0], -normal[1], -normal[2])
+        add_plane(normal, vertex)
+
+    # near / far：垂直于 camera["forward"]，分别朝向门后与门后远处。
+    forward_length = _length(forward)
+    if forward_length <= EPS:
+        return []
+    unit_forward = (
+        forward[0] / forward_length,
+        forward[1] / forward_length,
+        forward[2] / forward_length,
+    )
+    add_plane(unit_forward, (eye[0] + unit_forward[0] * near_value,
+                             eye[1] + unit_forward[1] * near_value,
+                             eye[2] + unit_forward[2] * near_value))
+    add_plane((-unit_forward[0], -unit_forward[1], -unit_forward[2]),
+              (eye[0] + unit_forward[0] * far_value,
+               eye[1] + unit_forward[1] * far_value,
+               eye[2] + unit_forward[2] * far_value))
+
+    if len(planes) != 6:
+        return []
+    return planes
 
 
 def clip_polygon(polygon, plane):
@@ -91,7 +329,58 @@ def clip_polygon(polygon, plane):
     必须处理退化：结果顶点少于 3 个，或按 Newell 法计算的面积 <= 1e-6 时
     返回 ``[]``，绝不能让空 / 退化多边形继续参与后续运算。
     """
-    raise NotImplementedError
+    if not isinstance(polygon, (list, tuple)):
+        return []
+    if len(polygon) < 3:
+        return []
+    try:
+        vertices = [tuple(_point(vertex, "多边形顶点")) for vertex in polygon]
+    except PortalError:
+        return []
+    plane_values = _normalize_plane(plane)
+    if plane_values is None:
+        return []
+    a, b, c, d = plane_values
+
+    def signed(point):
+        return a * point[0] + b * point[1] + c * point[2] + d
+
+    output = []
+    count = len(vertices)
+    for index in range(count):
+        current = vertices[index]
+        following = vertices[(index + 1) % count]
+        current_value = signed(current)
+        following_value = signed(following)
+        current_inside = current_value >= -EPS
+        following_inside = following_value >= -EPS
+
+        if current_inside:
+            output.append(current)
+            if not following_inside:
+                denominator = current_value - following_value
+                if abs(denominator) > EPS:
+                    t = current_value / denominator
+                    output.append((
+                        current[0] + t * (following[0] - current[0]),
+                        current[1] + t * (following[1] - current[1]),
+                        current[2] + t * (following[2] - current[2]),
+                    ))
+        elif following_inside:
+            denominator = current_value - following_value
+            if abs(denominator) > EPS:
+                t = current_value / denominator
+                output.append((
+                    current[0] + t * (following[0] - current[0]),
+                    current[1] + t * (following[1] - current[1]),
+                    current[2] + t * (following[2] - current[2]),
+                ))
+
+    if len(output) < 3:
+        return []
+    if _newell_area(output) <= EPS:
+        return []
+    return [list(vertex) for vertex in output]
 
 
 def traverse(scene, camera, max_depth):
@@ -111,7 +400,136 @@ def traverse(scene, camera, max_depth):
       合并去重后的裁剪面列表（没有房间的深度不占位）。
     - 空场景（``rooms`` 为空）返回 ``{"visible": [], "stages": []}``。
     """
-    raise NotImplementedError
+    _validate_max_depth(max_depth)
+    _validate_camera(camera)
+    rooms = _validate_rooms(scene)
+    portals = _validate_portals(scene)
+
+    if not rooms:
+        return {"visible": [], "stages": []}
+
+    start_room = camera["room"]
+    if start_room not in rooms:
+        raise PortalError("相机所在房间 %r 不存在" % (start_room,))
+
+    # 所有房间的 AABB 先校验，缺失 / 非法时立即失败。
+    bounds = {room_id: room_bounds(room_id, scene) for room_id in rooms}
+
+    frustum = [_normalize_plane(plane) for plane in camera["frustum"]]
+    frustum = [plane for plane in frustum if plane is not None]
+
+    objects = [{"id": room_id, "aabb": bounds[room_id]} for room_id in rooms]
+
+    visible = set()
+    if start_room in cull_objects(objects, frustum):
+        visible.add(start_room)
+
+    # stages[0] 就是主相机视锥本身；后续各层才累积传送门生成的子视锥。
+    stages = [list(camera["frustum"])]
+
+    # 队列元素：((room_id, 合并后的裁剪面, 路径), 已有深度)
+    queue = deque([((start_room, list(frustum), [start_room]), 0)])
+
+    while queue:
+        (room_id, room_frustum, path), depth = queue.popleft()
+        if depth >= max_depth:
+            continue
+
+        for portal in portals:
+            if not isinstance(portal, dict):
+                raise PortalError("传送门必须是字典")
+            if portal.get("from") != room_id:
+                continue
+            destination = portal.get("to")
+            if destination not in rooms:
+                raise PortalError("传送门指向的房间 %r 不存在" % (destination,))
+
+            quad = _validate_quad(portal.get("quad"))
+            if quad is None:
+                # 退化传送门无法裁剪，跳过而不是让它污染后续运算。
+                continue
+
+            normal = _quad_normal(quad)
+            normal_length = _length(normal)
+            if normal_length <= EPS:
+                continue
+            unit_normal = (normal[0] / normal_length,
+                           normal[1] / normal_length,
+                           normal[2] / normal_length)
+            eye = _point(camera["position"], "camera.position")
+            # 只穿正面：观察者必须在门的前侧。
+            if _dot(unit_normal, _sub(eye, quad[0])) <= EPS:
+                continue
+
+            # 传送门四边形必须落在当前层视锥内，否则透过它看不到任何东西。
+            if not _polygon_inside(room_frustum, quad):
+                continue
+            if not loop_guard(path, destination, 1):
+                continue
+
+            child_frustum = portal_frustum(
+                camera, [list(vertex) for vertex in quad],
+                _TRAVERSE_NEAR, _TRAVERSE_FAR,
+            )
+            if not child_frustum:
+                continue
+
+            merged = merge_frusta([room_frustum, child_frustum])
+            new_depth = depth + 1
+            new_path = path + [destination]
+
+            if destination not in visible:
+                if _aabb_inside(merged, bounds[destination]):
+                    visible.add(destination)
+
+            if len(stages) <= new_depth:
+                stages.append(list(merged))
+            else:
+                stages[new_depth] = merge_frusta([stages[new_depth], merged])
+
+            if new_depth < max_depth:
+                queue.append(((destination, merged, new_path), new_depth))
+
+    return {"visible": _sorted_rooms(visible), "stages": stages}
+
+
+def _polygon_inside(frustum, polygon):
+    """多边形是否与所有裁剪面内侧有非退化交集（逐面裁剪）。"""
+    current = [list(vertex) for vertex in polygon]
+    for plane in frustum:
+        current = clip_polygon(current, plane)
+        if not current:
+            return False
+    return True
+
+
+def _aabb_inside(frustum, aabb):
+    """AABB 是否可能位于所有裁剪面内侧（8 角点判定，与 cull_objects 一致）。"""
+    if not frustum:
+        return True
+    for plane in frustum:
+        a, b, c, d = plane
+        min_x, min_y, min_z, max_x, max_y, max_z = aabb
+        if (
+            a * min_x + b * min_y + c * min_z + d < -EPS
+            and a * max_x + b * min_y + c * min_z + d < -EPS
+            and a * min_x + b * max_y + c * min_z + d < -EPS
+            and a * max_x + b * max_y + c * min_z + d < -EPS
+            and a * min_x + b * min_y + c * max_z + d < -EPS
+            and a * max_x + b * min_y + c * max_z + d < -EPS
+            and a * min_x + b * max_y + c * max_z + d < -EPS
+            and a * max_x + b * max_y + c * max_z + d < -EPS
+        ):
+            return False
+    return True
+
+
+def _sorted_rooms(room_ids):
+    """房间 id 升序；混合类型无法直接比较时退回稳定字符串序。"""
+    try:
+        return sorted(room_ids)
+    except TypeError:
+        return sorted(room_ids, key=lambda value: (type(value).__name__, str(value)))
 
 
 def merge_frusta(frusta):
@@ -128,7 +546,32 @@ def merge_frusta(frusta):
     空输入返回 ``[]``。重复输入不得让面数增长：同一组面重复传入的结果
     必须与只传一次相同，避免面数指数增长。
     """
-    raise NotImplementedError
+    if frusta is None:
+        return []
+    if isinstance(frusta, (str, bytes)) or not isinstance(frusta, Sequence):
+        return []
+
+    merged = []
+    for frustum in frusta:
+        if frustum is None:
+            continue
+        if isinstance(frustum, (str, bytes)) or not isinstance(frustum, Sequence):
+            continue
+        for plane in frustum:
+            normalized = _normalize_plane(plane)
+            if normalized is None:
+                continue
+            duplicate = False
+            for kept in merged:
+                if all(
+                    abs(normalized[index] - kept[index]) <= EPS
+                    for index in range(4)
+                ):
+                    duplicate = True
+                    break
+            if not duplicate:
+                merged.append(normalized)
+    return merged
 
 
 def room_bounds(room_id, scene):
@@ -139,7 +582,31 @@ def room_bounds(room_id, scene):
     房间不存在时抛 ``PortalError``；禁止用 ``(0, 0, 0)`` 之类的默认值兜底，
     否则缺失房间里的物体会被误剔。
     """
-    raise NotImplementedError
+    rooms = _validate_rooms(scene)
+    try:
+        exists = room_id in rooms
+    except TypeError:
+        raise PortalError("房间 id 必须可哈希") from None
+    if not exists:
+        raise PortalError("房间 %r 不存在" % (room_id,))
+
+    room = rooms[room_id]
+    if not isinstance(room, dict) or "aabb" not in room:
+        raise PortalError("房间 %r 缺少 aabb" % (room_id,))
+    aabb = room["aabb"]
+    if isinstance(aabb, (str, bytes)) or not isinstance(aabb, Sequence):
+        raise PortalError("房间 %r 的 aabb 必须是 6 个数值" % (room_id,))
+    if len(aabb) != 6:
+        raise PortalError("房间 %r 的 aabb 长度必须是 6" % (room_id,))
+
+    values = tuple(_number(component) for component in aabb)
+    if any(component is None for component in values):
+        raise PortalError("房间 %r 的 aabb 必须是有限数值" % (room_id,))
+
+    min_x, min_y, min_z, max_x, max_y, max_z = values
+    if min_x > max_x or min_y > max_y or min_z > max_z:
+        raise PortalError("房间 %r 的 aabb 非法：min > max" % (room_id,))
+    return values
 
 
 def cull_objects(objects, frustum):
@@ -154,7 +621,53 @@ def cull_objects(objects, frustum):
     （距离 <= 1e-6）或跨越边界的物体一律保留，禁止只测中心点。
     ``frustum`` 为空视为没有裁剪面，保留全部；``objects`` 为空返回 ``[]``。
     """
-    raise NotImplementedError
+    if objects is None:
+        return []
+    if isinstance(objects, (str, bytes)) or not isinstance(objects, Sequence):
+        raise PortalError("objects 必须是列表")
+
+    planes = []
+    if frustum is not None:
+        if isinstance(frustum, (str, bytes)) or not isinstance(frustum, Sequence):
+            raise PortalError("frustum 必须是列表")
+        for plane in frustum:
+            normalized = _normalize_plane(plane)
+            if normalized is not None:
+                planes.append(normalized)
+
+    kept = []
+    for item in objects:
+        if not isinstance(item, dict) or "id" not in item or "aabb" not in item:
+            raise PortalError("物体必须含 id 与 aabb")
+        aabb = item["aabb"]
+        if isinstance(aabb, (str, bytes)) or not isinstance(aabb, Sequence):
+            raise PortalError("物体 aabb 必须是 6 个数值")
+        if len(aabb) != 6:
+            raise PortalError("物体 aabb 长度必须是 6")
+        values = tuple(_number(component) for component in aabb)
+        if any(component is None for component in values):
+            raise PortalError("物体 aabb 必须是有限数值")
+        min_x, min_y, min_z, max_x, max_y, max_z = values
+
+        outside = False
+        for a, b, c, d in planes:
+            all_outside = True
+            for x in (min_x, max_x):
+                for y in (min_y, max_y):
+                    for z in (min_z, max_z):
+                        if a * x + b * y + c * z + d >= -EPS:
+                            all_outside = False
+                            break
+                    if not all_outside:
+                        break
+                if not all_outside:
+                    break
+            if all_outside:
+                outside = True
+                break
+        if not outside:
+            kept.append(item["id"])
+    return kept
 
 
 def loop_guard(path, room_id, max_visits):
@@ -168,7 +681,25 @@ def loop_guard(path, room_id, max_visits):
     ``max_visits < 1``、``path`` 非序列或 ``room_id`` 不可哈希时抛
     ``PortalError``。
     """
-    raise NotImplementedError
+    if isinstance(max_visits, bool) or not isinstance(max_visits, int):
+        raise PortalError("max_visits 必须是整数")
+    if max_visits < 1:
+        raise PortalError("max_visits 必须 >= 1")
+    if isinstance(path, (str, bytes)) or not isinstance(path, Sequence):
+        raise PortalError("path 必须是房间 id 序列")
+    try:
+        hash(room_id)
+    except TypeError:
+        raise PortalError("room_id 必须可哈希") from None
+
+    visits = 0
+    for entry in path:
+        try:
+            if entry == room_id:
+                visits += 1
+        except Exception:  # pragma: no cover - 极端自定义类型
+            continue
+    return visits < max_visits
 
 
 def visibility_batch(scenes, cameras):
@@ -183,4 +714,18 @@ def visibility_batch(scenes, cameras):
     返回 ``{索引: traverse 结果}``，键按输入顺序 ``0..n-1``；
     ``scenes`` 为空返回 ``{}``。
     """
-    raise NotImplementedError
+    if isinstance(scenes, (str, bytes)) or not isinstance(scenes, Sequence):
+        raise PortalError("scenes 必须是序列")
+    if isinstance(cameras, (str, bytes)) or not isinstance(cameras, Sequence):
+        raise PortalError("cameras 必须是序列")
+    if len(scenes) != len(cameras):
+        raise PortalError("scenes 与 cameras 长度不一致")
+
+    results = {}
+    for index, (scene, camera) in enumerate(zip(scenes, cameras)):
+        if not isinstance(camera, dict):
+            raise PortalError("camera 必须是字典")
+        max_depth = camera.get("max_depth", 2)
+        # 每个场景独立调用，绝不共享裁剪面缓冲或中间结果。
+        results[index] = traverse(scene, camera, max_depth)
+    return results
